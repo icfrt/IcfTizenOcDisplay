@@ -8,6 +8,8 @@
    <tizen:application id="dGmEjmPhV8.IcfTizenOcDisplay" package="dGmEjmPhV8" required_version="2.3"></tizen:application>
    <tizen:privilege name="http://tizen.org/privilege/application.launch"></tizen:privilege>
    <tizen:privilege name="http://tizen.org/privilege/internet"></tizen:privilege>
+   <tizen:privilege name="http://tizen.org/privilege/filesystem.read"></tizen:privilege>
+   <tizen:privilege name="http://tizen.org/privilege/filesystem.write"></tizen:privilege>
    <access origin="*" subdomains="true"></access>
    <tizen:metadata key="http://samsung.com/tv/metadata/prelaunch.support" value="true"></tizen:metadata>
    <tizen:metadata key="http://tizen.org/metadata/app_ui_type/base_screen_resolution" value="extensive"></tizen:metadata>

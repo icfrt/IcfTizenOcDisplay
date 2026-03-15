@@ -82,8 +82,8 @@ function pollForConfig(code) {
         .then(res => {
           if (res.status === 200) {
             return res.json().then(config => resolve(config));
-          } else if (res.status === 404) {
-            // Not provisioned yet — try again
+          } else if (res.status === 404 || res.status >= 500) {
+            // Not provisioned yet, or transient server error — try again
             setTimeout(attempt, PROVISION_POLL_MS);
           } else {
             reject(new Error('Unexpected response from config server: ' + res.status));
@@ -99,21 +99,82 @@ function pollForConfig(code) {
   });
 }
 
-function applyAndStoreConfig(config) {
+async function applyAndStoreConfig(config) {
   state.webdavUrl = config.webdavUrl || '';
-  state.username = config.username || '';
-  state.password = config.password || '';
+  state.username  = config.username  || '';
+  state.password  = config.password  || '';
+  // Write to both stores: filesystem is the durable primary, localStorage is
+  // the quick fallback for environments where tizen.filesystem is unavailable.
+  await writeConfigToFilesystem({ webdavUrl: state.webdavUrl, username: state.username, password: state.password });
   localStorage.setItem('owncloud.webdavUrl', state.webdavUrl);
-  localStorage.setItem('owncloud.username', state.username);
-  localStorage.setItem('owncloud.password', state.password);
+  localStorage.setItem('owncloud.username',  state.username);
+  localStorage.setItem('owncloud.password',  state.password);
+}
+
+// ─── Persistent config storage ────────────────────────────────────────────────
+// Primary store: tizen.filesystem `documents` virtual root — survives app
+// updates and reinstalls.  Falls back to localStorage for browser testing.
+
+const CONFIG_FILENAME = 'icf-display-config.json';
+
+function readConfigFromFilesystem() {
+  return new Promise((resolve) => {
+    if (typeof tizen === 'undefined') { resolve(null); return; }
+    tizen.filesystem.resolve('documents', (dir) => {
+      try {
+        const file = dir.resolve(CONFIG_FILENAME);
+        const stream = file.openStream('r', (s) => {
+          try {
+            const text = s.read(file.fileSize);
+            s.close();
+            resolve(JSON.parse(text));
+          } catch (_) { resolve(null); }
+        }, () => resolve(null), 'UTF-8');
+      } catch (_) { resolve(null); }
+    }, () => resolve(null), 'r');
+  });
+}
+
+function writeConfigToFilesystem(config) {
+  return new Promise((resolve) => {
+    if (typeof tizen === 'undefined') { resolve(); return; }
+    tizen.filesystem.resolve('documents', (dir) => {
+      try {
+        let file;
+        try { file = dir.resolve(CONFIG_FILENAME); }
+        catch (_) { file = dir.createFile(CONFIG_FILENAME); }
+        file.openStream('w', (s) => {
+          try { s.write(JSON.stringify(config)); } finally { s.close(); }
+          resolve();
+        }, () => resolve(), 'UTF-8');
+      } catch (_) { resolve(); }
+    }, () => resolve(), 'rw');
+  });
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-function loadConfig() {
-  state.webdavUrl = localStorage.getItem('owncloud.webdavUrl') || '';
-  state.username = localStorage.getItem('owncloud.username') || '';
-  state.password = localStorage.getItem('owncloud.password') || '';
+async function loadConfig() {
+  // 1. Try persistent filesystem (survives reinstalls)
+  let cfg = await readConfigFromFilesystem();
+
+  // 2. Fall back to localStorage (warm start in browser, or pre-migration TVs)
+  if (!cfg) {
+    const url = localStorage.getItem('owncloud.webdavUrl');
+    const user = localStorage.getItem('owncloud.username');
+    const pass = localStorage.getItem('owncloud.password');
+    if (url && user && pass) {
+      cfg = { webdavUrl: url, username: user, password: pass };
+      // Migrate to filesystem so future boots are durable
+      await writeConfigToFilesystem(cfg);
+    }
+  }
+
+  if (cfg) {
+    state.webdavUrl = cfg.webdavUrl || '';
+    state.username  = cfg.username  || '';
+    state.password  = cfg.password  || '';
+  }
 }
 
 function isProvisioned() {
@@ -416,7 +477,7 @@ async function init() {
     }
   });
 
-  loadConfig();
+  await loadConfig();
 
   if (!isProvisioned()) {
     const code = generatePairingCode();
