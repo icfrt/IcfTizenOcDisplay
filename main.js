@@ -1,10 +1,13 @@
-const IMAGE_FOLDER = "images";
 const SLIDE_INTERVAL_MS = 10000;
 const SYNC_INTERVAL_MS = 60 * 1000;
 const IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"];
 const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024; // 50 MB hard limit per image
 // Retry delays (ms) after a failed sync: 5s, 15s, 30s, 60s, then normal interval
 const SYNC_RETRY_DELAYS_MS = [5000, 15000, 30000, 60000];
+
+const DB_NAME = 'icf-slides';
+const DB_VERSION = 1;
+const DB_STORE = 'images';
 
 const appConfig = window.appConfig || {};
 const HARD_CODED_WEBDAV_URL = appConfig.webdavUrl || "https://fallback/";
@@ -15,7 +18,7 @@ let slides = [];
 let currentSlideIndex = -1;
 let activeSlide = "A";
 let slideTimer = null;
-let imageDirectory = null;
+let imageDB = null;
 let syncRetryCount = 0;
 let syncScheduleTimer = null;
 
@@ -45,8 +48,6 @@ function log(status, level = 'info') {
     console.debug(status);
   }
 }
-
-
 
 function saveConfig() {
   state.webdavUrl = document.getElementById("config-url").value.trim();
@@ -94,91 +95,120 @@ function isImageFile(name) {
   return IMAGE_EXTENSIONS.some(ext => normalized.endsWith(ext));
 }
 
-function getMimeTypeFromName(name) {
-  const ext = name.toLowerCase().split('.').pop();
-  switch (ext) {
-    case 'jpg':
-    case 'jpeg':
-      return 'image/jpeg';
-    case 'png':
-      return 'image/png';
-    case 'gif':
-      return 'image/gif';
-    case 'bmp':
-      return 'image/bmp';
-    case 'webp':
-      return 'image/webp';
-    default:
-      return 'application/octet-stream';
+// ─── IndexedDB storage ───────────────────────────────────────────────────────
+
+function openImageDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(DB_STORE)) {
+        db.createObjectStore(DB_STORE, { keyPath: 'filename' });
+      }
+    };
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror = e => reject(e.target.error);
+  });
+}
+
+// Stores or replaces a record: { filename, blob, lastmodified, size }
+function dbPutImage(record) {
+  return new Promise((resolve, reject) => {
+    const tx = imageDB.transaction(DB_STORE, 'readwrite');
+    tx.objectStore(DB_STORE).put(record);
+    tx.oncomplete = () => resolve();
+    tx.onerror = e => reject(e.target.error);
+  });
+}
+
+function dbGetAllImages() {
+  return new Promise((resolve, reject) => {
+    const tx = imageDB.transaction(DB_STORE, 'readonly');
+    const req = tx.objectStore(DB_STORE).getAll();
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror = e => reject(e.target.error);
+  });
+}
+
+function dbGetImage(filename) {
+  return new Promise((resolve, reject) => {
+    const tx = imageDB.transaction(DB_STORE, 'readonly');
+    const req = tx.objectStore(DB_STORE).get(filename);
+    req.onsuccess = e => resolve(e.target.result || null);
+    req.onerror = e => reject(e.target.error);
+  });
+}
+
+function dbDeleteImage(filename) {
+  return new Promise((resolve, reject) => {
+    const tx = imageDB.transaction(DB_STORE, 'readwrite');
+    tx.objectStore(DB_STORE).delete(filename);
+    tx.oncomplete = () => resolve();
+    tx.onerror = e => reject(e.target.error);
+  });
+}
+
+// ─── Slideshow ────────────────────────────────────────────────────────────────
+
+async function loadLocalImages() {
+  const records = await dbGetAllImages();
+  const oldSlides = slides;
+
+  slides = records.map(record => ({
+    filename: record.filename,
+    objectUrl: URL.createObjectURL(record.blob),
+  }));
+
+  // Revoke old object URLs after building the new array.
+  // Safe to do even if a URL is currently displayed — Chromium keeps the
+  // underlying resource alive as long as an element references it.
+  for (const slide of oldSlides) {
+    URL.revokeObjectURL(slide.objectUrl);
+  }
+
+  if (slides.length === 0) {
+    log('No images in local storage.');
+  } else {
+    log(`${slides.length} local images loaded for slideshow`);
   }
 }
 
-function readFileAsText(file) {
-  return new Promise((resolve, reject) => {
-    file.openStream(
-      'r',
-      stream => {
-        try {
-          const text = stream.read(file.fileSize || 0);
-          stream.close();
-          resolve(text);
-        } catch (e) {
-          stream.close();
-          reject(e);
-        }
-      },
-      err => reject(err),
-      'UTF-8'
-    );
-  });
+function showSlide(index) {
+  if (slides.length === 0) return;
+  currentSlideIndex = (index + slides.length) % slides.length;
+  const entry = slides[currentSlideIndex];
+  if (!entry) return;
+
+  const nextSlide = activeSlide === 'A' ? 'B' : 'A';
+  const currentImage = document.getElementById(`slide${activeSlide}`);
+  const nextImage = document.getElementById(`slide${nextSlide}`);
+
+  nextImage.onerror = () => log(`Failed to display ${entry.filename}`, 'error');
+  nextImage.src = entry.objectUrl;
+  nextImage.style.opacity = '1';
+  if (currentImage) currentImage.style.opacity = '0';
+  activeSlide = nextSlide;
+
+  log(`Displaying slide ${currentSlideIndex + 1} / ${slides.length}: ${entry.filename}`);
 }
 
-function listFilesAsync(directory) {
-  return new Promise((resolve, reject) => {
-    try {
-      directory.listFiles(
-        files => resolve(files),
-        err => reject(err)
-      );
-    } catch (e) {
-      reject(e);
-    }
-  });
-}
-
-async function getFileFromDirectory(directory, name) {
-  try {
-    const files = await listFilesAsync(directory);
-    return files.find(f => f.isFile && f.name === name) || null;
-  } catch (e) {
-    return null;
+function startSlideshow() {
+  if (slides.length === 0) {
+    log('No slides to show.');
+    return;
   }
+
+  if (slideTimer) clearInterval(slideTimer);
+  let index = 0;
+  showSlide(index);
+  slideTimer = setInterval(() => {
+    index += 1;
+    showSlide(index);
+  }, SLIDE_INTERVAL_MS);
+  log('Slideshow started.');
 }
 
-function resolveLocalFolder() {
-  return new Promise((resolve, reject) => {
-    tizen.filesystem.resolve(
-      'documents',
-      async dir => {
-        try {
-          const files = await listFilesAsync(dir);
-          let folder = dir;
-          const existing = files.find(x => x.isDirectory && x.name === IMAGE_FOLDER);
-          if (existing) {
-            folder = dir.resolve(IMAGE_FOLDER);
-          } else {
-            folder = dir.createDirectory(IMAGE_FOLDER);
-          }
-          resolve(folder);
-        } catch (e) {
-          reject(e);
-        }
-      },
-      e => reject(e),
-      'rw'
-    );
-  });
-}
+// ─── Remote sync ──────────────────────────────────────────────────────────────
 
 async function listRemoteImages() {
   if (!state.webdavUrl) throw new Error('WebDAV URL is not set');
@@ -230,99 +260,18 @@ async function listRemoteImages() {
   return props;
 }
 
-function loadLocalImageMeta() {
-  try {
-    const raw = localStorage.getItem('owncloud.imageMeta');
-    return raw ? JSON.parse(raw) : {};
-  } catch (e) {
-    return {};
-  }
-}
-
-function saveLocalImageMeta(meta) {
-  localStorage.setItem('owncloud.imageMeta', JSON.stringify(meta));
-}
-
-async function saveFileFromBlob(directory, filename, blob) {
-  let file = await getFileFromDirectory(directory, filename);
-  if (!file) {
-    file = directory.createFile(filename);
-  }
-
-  const dataUrl = await new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(blob);
-  });
-
-  const base64Data = dataUrl.split(',')[1] || '';
-
-  await new Promise((resolve, reject) => {
-    file.openStream(
-      'w',
-      stream => {
-        try {
-          stream.write(base64Data);
-          stream.close();
-          resolve(file);
-        } catch (e) {
-          stream.close();
-          reject(e);
-        }
-      },
-      err => reject(err),
-      'UTF-8'
-    );
-  });
-
-  console.log(`Saved ${filename} to ${file.toURI()} size ${file.fileSize}`);
-  return { file, dataUrl, base64Data };
-}
-
-async function loadLocalImages() {
-  if (!imageDirectory) imageDirectory = await resolveLocalFolder();
-  const localFiles = (await listFilesAsync(imageDirectory)).filter(f => f.isFile && isImageFile(f.name));
-  slides = [];
-  for (const file of localFiles) {
-    try {
-      const raw = await readFileAsText(file);
-      let base64Data;
-      if (raw.trim().startsWith('data:')) {
-        base64Data = raw.trim().split(',')[1] || '';
-      } else {
-        base64Data = raw.trim();
-      }
-      const mimeType = getMimeTypeFromName(file.name);
-      const dataUrl = `data:${mimeType};base64,${base64Data}`;
-      slides.push({ file, dataUrl });
-    } catch (e) {
-      console.warn('Reading local file for slideshow failed', file.name, e);
-    }
-  }
-  if (slides.length === 0) {
-    log('No images in local folder.');
-  } else {
-    log(`${slides.length} local images loaded for slideshow`);
-  }
-}
-
 async function syncImages() {
   log('Sync started...');
   try {
     const remoteFiles = await listRemoteImages();
-    if (!imageDirectory) imageDirectory = await resolveLocalFolder();
-
-    const imageMeta = loadLocalImageMeta();
     const remoteNames = remoteFiles.map(r => r.filename);
     let changedCount = 0;
 
     for (const remote of remoteFiles) {
-      const currentFile = await getFileFromDirectory(imageDirectory, remote.filename);
-      const stored = imageMeta[remote.filename];
+      const stored = await dbGetImage(remote.filename);
       const remoteMod = remote.lastmodified || '';
 
-      const needDownload = !currentFile || !stored || stored.lastmodified !== remoteMod || stored.size !== remote.size;
+      const needDownload = !stored || stored.lastmodified !== remoteMod || stored.size !== remote.size;
       if (!needDownload) continue;
 
       // Guard: reject oversized files before downloading using the size reported by WebDAV
@@ -352,133 +301,30 @@ async function syncImages() {
         continue;
       }
 
-      const { dataUrl } = await saveFileFromBlob(imageDirectory, remote.filename, blob);
-
-      imageMeta[remote.filename] = {
-        lastmodified: remoteMod,
-        size: remote.size,
-        updatedAt: new Date().toISOString(),
-      };
-
+      await dbPutImage({ filename: remote.filename, blob, lastmodified: remoteMod, size: remote.size });
       changedCount++;
-      log(`Downloaded/updated ${remote.filename} (${dataUrl ? 'base64 stored' : 'saved'})`);
+      log(`Downloaded/updated ${remote.filename}`);
     }
 
-    // Remove local files that are no longer present remotely
-    const localFiles = (await listFilesAsync(imageDirectory)).filter(f => f.isFile && isImageFile(f.name));
-    for (const local of localFiles) {
-      if (!remoteNames.includes(local.name)) {
-        try {
-          local.deleteFile();
-          delete imageMeta[local.name];
-          log(`Removed stale local file ${local.name}`);
-        } catch (e) {
-          console.warn('Cannot delete stale file', local.name, e);
-        }
+    // Remove images no longer present on the server
+    const allStored = await dbGetAllImages();
+    for (const stored of allStored) {
+      if (!remoteNames.includes(stored.filename)) {
+        await dbDeleteImage(stored.filename);
+        log(`Removed stale image ${stored.filename}`);
       }
     }
 
-    saveLocalImageMeta(imageMeta);
-
     await loadLocalImages();
 
-    if (slides.length === 0) log('No images in local folder.');
-    else log(`${slides.length} images ready for slideshow (changed ${changedCount})`);
+    if (slides.length === 0) log('No images available.');
+    else log(`${slides.length} images ready (${changedCount} updated)`);
 
     return true;
   } catch (err) {
     log(`Sync error: ${err.message}`, 'error');
     return false;
   }
-}
-
-async function getDataURLFromFile(file) {
-  if (typeof file.readAsDataURL === 'function') {
-    return new Promise((resolve, reject) => file.readAsDataURL(resolve, reject));
-  }
-
-  const fileUri = file.toURI();
-  try {
-    const response = await fetch(encodeURI(fileUri));
-    if (!response.ok) {
-      throw new Error(`Fetch file:// failed ${response.status}`);
-    }
-    const blob = await response.blob();
-    return await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result);
-      reader.onerror = () => reject(reader.error);
-      reader.readAsDataURL(blob);
-    });
-  } catch (err) {
-    throw new Error(`getDataURLFromFile failed: ${err.message || err}`);
-  }
-}
-
-async function showSlide(index) {
-  if (slides.length === 0) return;
-  currentSlideIndex = (index + slides.length) % slides.length;
-  const nextEntry = slides[currentSlideIndex];
-  if (!nextEntry) {
-    log(`No slide entry at index ${currentSlideIndex}`);
-    return;
-  }
-
-  const rawUrl = nextEntry.dataUrl || nextEntry.uri || '';
-  if (!rawUrl) {
-    log(`No slide URL/dataUrl for ${nextEntry.file ? nextEntry.file.name : 'unknown'}`);
-    return;
-  }
-
-  const encodedUrl = rawUrl.startsWith('data:')
-    ? rawUrl
-    : (rawUrl.includes('%') ? rawUrl : encodeURI(rawUrl));
-
-  const currentImage = document.getElementById(`slide${activeSlide}`);
-  const nextSlide = activeSlide === 'A' ? 'B' : 'A';
-  const nextImage = document.getElementById(`slide${nextSlide}`);
-
-  nextImage.onerror = async () => {
-    log(`Image URL failed, attempting DataURL fallback`);
-    if (nextEntry.dataUrl) {
-      nextImage.src = nextEntry.dataUrl;
-      return;
-    }
-    if (nextEntry.uri) {
-      nextImage.src = nextEntry.uri;
-      return;
-    }
-    log('No fallback image source available');
-  };
-
-  if (nextEntry.dataUrl) {
-    nextImage.src = nextEntry.dataUrl;
-  } else if (nextEntry.uri) {
-    nextImage.src = nextEntry.uri;
-  } else {
-    nextImage.src = encodedUrl;
-  }
-  nextImage.style.opacity = '1';
-  if (currentImage) currentImage.style.opacity = '0';
-  activeSlide = nextSlide;
-
-  log(`Displaying slide ${currentSlideIndex + 1} / ${slides.length} (path: ${encodedUrl})`);
-}
-
-function startSlideshow() {
-  if (slides.length === 0) {
-    log('No slides found. Please run Sync now.');
-    return;
-  }
-
-  if (slideTimer) clearInterval(slideTimer);
-  let index = 0;
-  showSlide(index);
-  slideTimer = setInterval(() => {
-    index += 1;
-    showSlide(index);
-  }, SLIDE_INTERVAL_MS);
-  log('Slideshow started.');
 }
 
 function scheduleNextSync(isRetry) {
@@ -508,6 +354,8 @@ async function runSync() {
   }
 }
 
+// ─── Init ─────────────────────────────────────────────────────────────────────
+
 async function init() {
   window.addEventListener('tizenhwkey', event => {
     if (event.keyName === 'back') {
@@ -517,24 +365,20 @@ async function init() {
 
   loadConfig();
 
-  // Optional: keep the direct control buttons removed for single-configuration use.
-  // Instead, use hardcoded settings and start automatically.
-
-
   try {
-    imageDirectory = await resolveLocalFolder();
+    imageDB = await openImageDB();
   } catch (e) {
-    console.warn('image folder init failed', e);
-    log('Could not initialize local image folder.');
+    log('Could not open local image database.', 'error');
+    return;
   }
 
+  // Load whatever was stored from the last session — works fully offline.
   await loadLocalImages();
   if (slides.length > 0) {
     startSlideshow();
   }
 
-  // Start the sync loop. On failure it retries with backoff; on success it schedules the next
-  // periodic sync. This replaces the old setInterval to prevent overlapping sync runs.
+  // Sync in the background; starts slideshow if no local images were available.
   runSync();
 }
 
@@ -544,5 +388,5 @@ window.onload = () => {
     return;
   }
 
-  init().catch(err => log('Init failed: ' + err.message));
+  init().catch(err => log('Init failed: ' + err.message, 'error'));
 };
