@@ -512,6 +512,12 @@ async function syncImages() {
       await dbPutImage({ filename: remote.filename, blob, lastmodified: remoteMod, size: remote.size });
       changedCount++;
       log(`Downloaded/updated ${remote.filename}`);
+
+      // Start slideshow as soon as the first image is available — don't wait for the full sync
+      if (!slideTimer) {
+        await loadLocalImages();
+        if (slides.length > 0) startSlideshow();
+      }
     }
 
     // Remove images no longer present on the server
