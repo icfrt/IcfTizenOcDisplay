@@ -9,10 +9,9 @@ const DB_NAME = 'icf-slides';
 const DB_VERSION = 1;
 const DB_STORE = 'images';
 
-const appConfig = window.appConfig || {};
-const HARD_CODED_WEBDAV_URL = appConfig.webdavUrl || "https://fallback/";
-const HARD_CODED_USERNAME = appConfig.username || "";
-const HARD_CODED_PASSWORD = appConfig.password || "";
+const CONFIG_SERVER_URL = (window.appConfig && window.appConfig.configServerUrl) || '';
+const PROVISION_POLL_MS = 5000;
+const PAIRING_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O/1/I/L
 
 let slides = [];
 let currentSlideIndex = -1;
@@ -23,9 +22,9 @@ let syncRetryCount = 0;
 let syncScheduleTimer = null;
 
 const state = {
-  webdavUrl: HARD_CODED_WEBDAV_URL,
-  username: HARD_CODED_USERNAME,
-  password: HARD_CODED_PASSWORD,
+  webdavUrl: '',
+  username: '',
+  password: '',
 };
 
 const statusEl = () => document.getElementById("status");
@@ -49,39 +48,76 @@ function log(status, level = 'info') {
   }
 }
 
-function saveConfig() {
-  state.webdavUrl = document.getElementById("config-url").value.trim();
-  state.username = document.getElementById("config-user").value.trim();
-  state.password = document.getElementById("config-pass").value;
-  localStorage.setItem("owncloud.webdavUrl", state.webdavUrl);
-  localStorage.setItem("owncloud.username", state.username);
-  localStorage.setItem("owncloud.password", state.password);
-  log("Settings saved.");
+// ─── Provisioning ─────────────────────────────────────────────────────────────
+
+function generatePairingCode() {
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += PAIRING_CHARS[Math.floor(Math.random() * PAIRING_CHARS.length)];
+  }
+  return code;
 }
 
+function showProvisioningScreen(code) {
+  const el = document.getElementById('provision');
+  if (!el) return;
+  const codeEl = document.getElementById('provision-code');
+  const urlEl = document.getElementById('provision-url');
+  if (codeEl) codeEl.textContent = code;
+  if (urlEl) urlEl.textContent = CONFIG_SERVER_URL.replace(/config\.php$/, 'setup.php');
+  el.classList.add('visible');
+}
+
+function hideProvisioningScreen() {
+  const el = document.getElementById('provision');
+  if (el) el.classList.remove('visible');
+}
+
+function pollForConfig(code) {
+  return new Promise((resolve, reject) => {
+    const url = CONFIG_SERVER_URL + '?code=' + encodeURIComponent(code);
+
+    function attempt() {
+      fetch(url)
+        .then(res => {
+          if (res.status === 200) {
+            return res.json().then(config => resolve(config));
+          } else if (res.status === 404) {
+            // Not provisioned yet — try again
+            setTimeout(attempt, PROVISION_POLL_MS);
+          } else {
+            reject(new Error('Unexpected response from config server: ' + res.status));
+          }
+        })
+        .catch(() => {
+          // Network error — keep polling
+          setTimeout(attempt, PROVISION_POLL_MS);
+        });
+    }
+
+    attempt();
+  });
+}
+
+function applyAndStoreConfig(config) {
+  state.webdavUrl = config.webdavUrl || '';
+  state.username = config.username || '';
+  state.password = config.password || '';
+  localStorage.setItem('owncloud.webdavUrl', state.webdavUrl);
+  localStorage.setItem('owncloud.username', state.username);
+  localStorage.setItem('owncloud.password', state.password);
+}
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+
 function loadConfig() {
-  // Primary source: hard-coded constants to lock configuration for single-TV use.
-  state.webdavUrl = HARD_CODED_WEBDAV_URL;
-  state.username = HARD_CODED_USERNAME;
-  state.password = HARD_CODED_PASSWORD;
+  state.webdavUrl = localStorage.getItem('owncloud.webdavUrl') || '';
+  state.username = localStorage.getItem('owncloud.username') || '';
+  state.password = localStorage.getItem('owncloud.password') || '';
+}
 
-  // Optional override from localStorage if you still want to adjust without code deployment.
-  if (localStorage.getItem("owncloud.webdavUrl")) {
-    state.webdavUrl = localStorage.getItem("owncloud.webdavUrl");
-  }
-  if (localStorage.getItem("owncloud.username")) {
-    state.username = localStorage.getItem("owncloud.username");
-  }
-  if (localStorage.getItem("owncloud.password")) {
-    state.password = localStorage.getItem("owncloud.password");
-  }
-
-  const urlInput = document.getElementById("config-url");
-  if (urlInput) urlInput.value = state.webdavUrl;
-  const userInput = document.getElementById("config-user");
-  if (userInput) userInput.value = state.username;
-  const passInput = document.getElementById("config-pass");
-  if (passInput) passInput.value = state.password;
+function isProvisioned() {
+  return !!(state.webdavUrl && state.username && state.password);
 }
 
 function basicAuthHeader() {
@@ -381,6 +417,20 @@ async function init() {
   });
 
   loadConfig();
+
+  if (!isProvisioned()) {
+    const code = generatePairingCode();
+    showProvisioningScreen(code);
+    let config;
+    try {
+      config = await pollForConfig(code);
+    } catch (err) {
+      log('Provisioning failed: ' + err.message, 'error');
+      return;
+    }
+    applyAndStoreConfig(config);
+    hideProvisioningScreen();
+  }
 
   try {
     imageDB = await openImageDB();

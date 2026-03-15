@@ -63,6 +63,7 @@ excludes:
   - generate_sssp.py
   - build.bat
   - README.md
+  - server/*
 
 # project dependencies
 deps: []

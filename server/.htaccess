@@ -1,0 +1,20 @@
+# Protect setup.php with HTTP Basic Auth
+<Files "setup.php">
+    AuthType Basic
+    AuthName "Display Admin"
+    AuthUserFile /etc/apache2/.htpasswd-display
+    Require valid-user
+</Files>
+
+# Deny direct web access to the configs/ directory.
+# mod_rewrite is the primary guard; the <Directory> block is the fallback.
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^configs/ - [F,L]
+</IfModule>
+
+<IfModule !mod_rewrite.c>
+    <DirectoryMatch "configs">
+        Require all denied
+    </DirectoryMatch>
+</IfModule>
