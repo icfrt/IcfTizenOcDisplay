@@ -280,7 +280,24 @@ async function syncImages() {
         continue;
       }
 
-      const response = await fetch(remote.url, { headers: basicAuthHeader() });
+      // If we already have a copy, ask the server to skip the body if nothing changed.
+      // This covers the case where size or lastmodified metadata drifted (e.g. server
+      // re-indexed) but the actual file content is the same.
+      const fetchHeaders = Object.assign({}, basicAuthHeader());
+      if (stored && stored.lastmodified) {
+        fetchHeaders['If-Modified-Since'] = stored.lastmodified;
+      }
+
+      const response = await fetch(remote.url, { headers: fetchHeaders });
+
+      if (response.status === 304) {
+        // Server confirms the file hasn't changed — sync our stored metadata to the
+        // current PROPFIND values so we don't re-check on the next cycle.
+        await dbPutImage({ ...stored, lastmodified: remoteMod, size: remote.size });
+        log(`${remote.filename} unchanged (304)`);
+        continue;
+      }
+
       if (!response.ok) {
         log(`Skipping ${remote.filename}: HTTP ${response.status} ${response.statusText}`, 'error');
         continue;
