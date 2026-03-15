@@ -12,6 +12,7 @@ const DB_STORE = 'images';
 const CONFIG_SERVER_URL = (window.appConfig && window.appConfig.configServerUrl) || '';
 const PROVISION_POLL_MS = 5000;
 const PAIRING_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O/1/I/L
+const DEVICE_ID_FILENAME = 'icf-device-id';
 
 let slides = [];
 let currentSlideIndex = -1;
@@ -20,6 +21,7 @@ let slideTimer = null;
 let imageDB = null;
 let syncRetryCount = 0;
 let syncScheduleTimer = null;
+let deviceId = null;
 
 const state = {
   webdavUrl: '',
@@ -73,9 +75,101 @@ function hideProvisioningScreen() {
   if (el) el.classList.remove('visible');
 }
 
-function pollForConfig(code) {
+function generateDeviceId() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  // Fallback: manual UUID v4
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+  });
+}
+
+function loadOrCreateDeviceId() {
+  return new Promise((resolve) => {
+    if (typeof tizen === 'undefined') {
+      // Browser testing: use localStorage as stand-in
+      let id = localStorage.getItem('icf-device-id');
+      if (!id) {
+        id = generateDeviceId();
+        localStorage.setItem('icf-device-id', id);
+      }
+      resolve(id);
+      return;
+    }
+    tizen.filesystem.resolve('documents', (dir) => {
+      try {
+        const file = dir.resolve(DEVICE_ID_FILENAME);
+        file.openStream('r', (s) => {
+          try {
+            const id = s.read(file.fileSize).trim();
+            s.close();
+            resolve(id || null);
+          } catch (_) { resolve(null); }
+        }, () => resolve(null), 'UTF-8');
+      } catch (_) {
+        // File doesn't exist — generate and save a new UUID
+        const id = generateDeviceId();
+        try {
+          const file = dir.createFile(DEVICE_ID_FILENAME);
+          file.openStream('w', (s) => {
+            try { s.write(id); } finally { s.close(); }
+            resolve(id);
+          }, () => resolve(id), 'UTF-8');
+        } catch (__) { resolve(id); }
+      }
+    }, () => {
+      // Filesystem unavailable — generate ephemeral ID
+      resolve(generateDeviceId());
+    }, 'rw');
+  });
+}
+
+async function checkDeviceConfig(id) {
+  if (!id || !CONFIG_SERVER_URL) return null;
+  try {
+    const res = await fetch(CONFIG_SERVER_URL + '?device=' + encodeURIComponent(id));
+    if (res.status === 200) return await res.json();
+  } catch (_) {}
+  return null;
+}
+
+async function enterReprovisioningMode() {
+  // Clear stored config (filesystem + localStorage) but keep device UUID
+  await writeConfigToFilesystem({});
+  localStorage.removeItem('owncloud.webdavUrl');
+  localStorage.removeItem('owncloud.username');
+  localStorage.removeItem('owncloud.password');
+  state.webdavUrl = '';
+  state.username  = '';
+  state.password  = '';
+
+  // Check if server already has updated config for this device
+  const cfg = await checkDeviceConfig(deviceId);
+  if (cfg && cfg.webdavUrl && cfg.username && cfg.password) {
+    await applyAndStoreConfig(cfg);
+    return; // Resume slideshow without showing provisioning screen
+  }
+
+  // No server config — show normal pairing screen
+  const code = generatePairingCode();
+  showProvisioningScreen(code);
+  let config;
+  try {
+    config = await pollForConfig(code, deviceId);
+  } catch (err) {
+    log('Re-provisioning failed: ' + err.message, 'error');
+    return;
+  }
+  await applyAndStoreConfig(config);
+  hideProvisioningScreen();
+}
+
+function pollForConfig(code, id) {
   return new Promise((resolve, reject) => {
-    const url = CONFIG_SERVER_URL + '?code=' + encodeURIComponent(code);
+    let url = CONFIG_SERVER_URL + '?code=' + encodeURIComponent(code);
+    if (id) url += '&device=' + encodeURIComponent(id);
 
     function attempt() {
       fetch(url)
@@ -461,6 +555,16 @@ async function runSync() {
     if (slides.length > 0 && !slideTimer) {
       startSlideshow();
     }
+    // Check for server-pushed credential updates
+    const updated = await checkDeviceConfig(deviceId);
+    if (updated && updated.webdavUrl && updated.username && updated.password) {
+      if (updated.webdavUrl !== state.webdavUrl ||
+          updated.username  !== state.username  ||
+          updated.password  !== state.password) {
+        log('Credentials updated from server.');
+        await applyAndStoreConfig(updated);
+      }
+    }
     scheduleNextSync(false);
   } else {
     syncRetryCount++;
@@ -471,26 +575,49 @@ async function runSync() {
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
 async function init() {
-  window.addEventListener('tizenhwkey', event => {
-    if (event.keyName === 'back') {
-      tizen.application.getCurrentApplication().exit();
+  // Long-press Back (≥3s) → re-provisioning; short press → exit.
+  // keydown/keyup give us the hold duration; tizenhwkey is not used.
+  let backPressStart = null;
+  document.addEventListener('keydown', event => {
+    if (event.key === 'XF86Back' || event.keyCode === 10009) {
+      if (backPressStart === null) backPressStart = Date.now();
     }
   });
+  document.addEventListener('keyup', event => {
+    if (event.key === 'XF86Back' || event.keyCode === 10009) {
+      if (backPressStart === null) return;
+      const held = Date.now() - backPressStart;
+      backPressStart = null;
+      if (held >= 3000) {
+        enterReprovisioningMode().catch(err => log('Re-provisioning error: ' + err.message, 'error'));
+      } else {
+        tizen.application.getCurrentApplication().exit();
+      }
+    }
+  });
+
+  deviceId = await loadOrCreateDeviceId();
 
   await loadConfig();
 
   if (!isProvisioned()) {
-    const code = generatePairingCode();
-    showProvisioningScreen(code);
-    let config;
-    try {
-      config = await pollForConfig(code);
-    } catch (err) {
-      log('Provisioning failed: ' + err.message, 'error');
-      return;
+    // Server may already have config for this device (e.g. admin pre-updated)
+    const serverCfg = await checkDeviceConfig(deviceId);
+    if (serverCfg && serverCfg.webdavUrl && serverCfg.username && serverCfg.password) {
+      await applyAndStoreConfig(serverCfg);
+    } else {
+      const code = generatePairingCode();
+      showProvisioningScreen(code);
+      let config;
+      try {
+        config = await pollForConfig(code, deviceId);
+      } catch (err) {
+        log('Provisioning failed: ' + err.message, 'error');
+        return;
+      }
+      await applyAndStoreConfig(config);
+      hideProvisioningScreen();
     }
-    applyAndStoreConfig(config);
-    hideProvisioningScreen();
   }
 
   try {

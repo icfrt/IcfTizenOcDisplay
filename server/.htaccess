@@ -11,10 +11,14 @@
 <IfModule mod_rewrite.c>
     RewriteEngine On
     RewriteRule ^configs/ - [F,L]
+    RewriteRule ^devices/ - [F,L]
 </IfModule>
 
 <IfModule !mod_rewrite.c>
     <DirectoryMatch "configs">
+        Require all denied
+    </DirectoryMatch>
+    <DirectoryMatch "devices">
         Require all denied
     </DirectoryMatch>
 </IfModule>
