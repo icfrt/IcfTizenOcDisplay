@@ -2,6 +2,9 @@ const IMAGE_FOLDER = "images";
 const SLIDE_INTERVAL_MS = 10000;
 const SYNC_INTERVAL_MS = 60 * 1000;
 const IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"];
+const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024; // 50 MB hard limit per image
+// Retry delays (ms) after a failed sync: 5s, 15s, 30s, 60s, then normal interval
+const SYNC_RETRY_DELAYS_MS = [5000, 15000, 30000, 60000];
 
 const appConfig = window.appConfig || {};
 const HARD_CODED_WEBDAV_URL = appConfig.webdavUrl || "https://fallback/";
@@ -13,6 +16,8 @@ let currentSlideIndex = -1;
 let activeSlide = "A";
 let slideTimer = null;
 let imageDirectory = null;
+let syncRetryCount = 0;
+let syncScheduleTimer = null;
 
 const state = {
   webdavUrl: HARD_CODED_WEBDAV_URL,
@@ -225,15 +230,6 @@ async function listRemoteImages() {
   return props;
 }
 
-async function getFileFromDirectory(directory, name) {
-  try {
-    const files = await listFilesAsync(directory);
-    return files.find(f => f.isFile && f.name === name) || null;
-  } catch (e) {
-    return null;
-  }
-}
-
 function loadLocalImageMeta() {
   try {
     const raw = localStorage.getItem('owncloud.imageMeta');
@@ -329,13 +325,33 @@ async function syncImages() {
       const needDownload = !currentFile || !stored || stored.lastmodified !== remoteMod || stored.size !== remote.size;
       if (!needDownload) continue;
 
+      // Guard: reject oversized files before downloading using the size reported by WebDAV
+      if (remote.size > MAX_DOWNLOAD_BYTES) {
+        log(`Skipping ${remote.filename}: ${(remote.size / 1024 / 1024).toFixed(1)} MB exceeds 50 MB limit`, 'error');
+        continue;
+      }
+
       const response = await fetch(remote.url, { headers: basicAuthHeader() });
       if (!response.ok) {
-        console.warn('Skipping', remote.filename, response.status);
+        log(`Skipping ${remote.filename}: HTTP ${response.status} ${response.statusText}`, 'error');
+        continue;
+      }
+
+      // Guard: also check Content-Length from response headers (may differ from PROPFIND size)
+      const contentLength = parseInt(response.headers.get('Content-Length') || '0', 10);
+      if (contentLength > MAX_DOWNLOAD_BYTES) {
+        log(`Skipping ${remote.filename}: Content-Length ${(contentLength / 1024 / 1024).toFixed(1)} MB exceeds 50 MB limit`, 'error');
         continue;
       }
 
       const blob = await response.blob();
+
+      // Guard: verify actual downloaded size in case Content-Length was absent or wrong
+      if (blob.size > MAX_DOWNLOAD_BYTES) {
+        log(`Skipping ${remote.filename}: downloaded ${(blob.size / 1024 / 1024).toFixed(1)} MB exceeds 50 MB limit`, 'error');
+        continue;
+      }
+
       const { dataUrl } = await saveFileFromBlob(imageDirectory, remote.filename, blob);
 
       imageMeta[remote.filename] = {
@@ -368,9 +384,11 @@ async function syncImages() {
 
     if (slides.length === 0) log('No images in local folder.');
     else log(`${slides.length} images ready for slideshow (changed ${changedCount})`);
+
+    return true;
   } catch (err) {
-    console.error(err);
-    log(`Sync error: ${err.message}`);
+    log(`Sync error: ${err.message}`, 'error');
+    return false;
   }
 }
 
@@ -463,6 +481,33 @@ function startSlideshow() {
   log('Slideshow started.');
 }
 
+function scheduleNextSync(isRetry) {
+  if (syncScheduleTimer) clearTimeout(syncScheduleTimer);
+  let delay;
+  if (isRetry && syncRetryCount <= SYNC_RETRY_DELAYS_MS.length) {
+    delay = SYNC_RETRY_DELAYS_MS[Math.min(syncRetryCount - 1, SYNC_RETRY_DELAYS_MS.length - 1)];
+    log(`Sync failed. Retrying in ${delay / 1000}s (attempt ${syncRetryCount} of ${SYNC_RETRY_DELAYS_MS.length})…`, 'error');
+  } else {
+    delay = SYNC_INTERVAL_MS;
+    syncRetryCount = 0;
+  }
+  syncScheduleTimer = setTimeout(runSync, delay);
+}
+
+async function runSync() {
+  const success = await syncImages();
+  if (success) {
+    syncRetryCount = 0;
+    if (slides.length > 0 && !slideTimer) {
+      startSlideshow();
+    }
+    scheduleNextSync(false);
+  } else {
+    syncRetryCount++;
+    scheduleNextSync(true);
+  }
+}
+
 async function init() {
   window.addEventListener('tizenhwkey', event => {
     if (event.keyName === 'back') {
@@ -488,16 +533,9 @@ async function init() {
     startSlideshow();
   }
 
-  // Sync in background, then restart slideshow if local images were absent but synced successfully.
-  syncImages().then(() => {
-    if (slides.length > 0 && !slideTimer) {
-      startSlideshow();
-    }
-  }).catch(e => console.warn('Background sync failed', e));
-
-  setInterval(async () => {
-    await syncImages();
-  }, SYNC_INTERVAL_MS);
+  // Start the sync loop. On failure it retries with backoff; on success it schedules the next
+  // periodic sync. This replaces the old setInterval to prevent overlapping sync runs.
+  runSync();
 }
 
 window.onload = () => {
