@@ -31,6 +31,7 @@ files:
   - icon.png
   - index.html
   - main.js
+  - config.js
 
 # list of files to exclude based on the matched patterns
 excludes:
@@ -55,9 +56,13 @@ excludes:
   - \.wgt
   - webUnitTest/*
   - .gitgnore
+  - .gitattributes
   - .git/*
   - .vscode/*
   - config.template.js
+  - generate_sssp.py
+  - build.bat
+  - README.md
 
 # project dependencies
 deps: []
